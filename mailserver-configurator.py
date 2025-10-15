@@ -56,9 +56,12 @@ def split_email_pass(email_pass: str) -> Optional[Tuple[str, str]]:
         logger.error(f"Error parsing email:password '{email_pass}': {e}")
 
 
-def detect_running_containers(client: docker.DockerClient, image: str) -> Optional[List[docker.models.containers.Container]]:
-    """Detects if containers with the specified image are already running."""
-    containers = client.containers.list(all=True, filters={"ancestor": image})
+def detect_existing_containers(client: docker.DockerClient, image: str, only_running: bool = False) -> Optional[List[docker.models.containers.Container]]:
+    """Detects if containers with the specified image already exists (optionally, if they are running too)."""
+    if only_running:
+        containers = client.containers.list(filters={"ancestor": image})
+    else:
+        containers = client.containers.list(all=True, filters={"ancestor": image})
 
     if containers:
         names = [container.name for container in containers]
@@ -68,6 +71,21 @@ def detect_running_containers(client: docker.DockerClient, image: str) -> Option
         return containers
     else:
         logger.debug(f"No running container found with image '{image}'.")
+        return None
+    
+
+def detect_stopped_containers(client: docker.DockerClient, image: str) -> Optional[List[docker.models.containers.Container]]:
+    """Detects if containers with the specified image are stopped."""
+    containers = client.containers.list(all=True, filters={"ancestor": image, "status": "exited"})
+
+    if containers:
+        names = [container.name for container in containers]
+        short_ids = [container.short_id for container in containers]
+        tuples = list(zip(names, short_ids))
+        logger.debug(f"Found stopped containers with image '{image}': {tuples}.")
+        return containers
+    else:
+        logger.debug(f"No stopped container found with image '{image}'.")
         return None
     
 
@@ -200,6 +218,36 @@ def setup_mailserver(
         exit(1)
 
 
+# Start/stop mailserver
+
+def stop_mailserver(client: docker.DockerClient, image: str):
+    """Stops and removes all running containers with the specified image."""
+    containers = detect_existing_containers(client, image, only_running=True)
+    if containers:
+        logger.info("Stopping existing containers...")
+        for container in containers:
+            logger.debug(f"Stopping existing container '{container.name}' (id: {container.short_id})...")
+            container.stop()
+            logger.debug(f"Container '{container.name}' stopped and removed.")
+        logger.info("All existing containers stopped.")
+    else:
+        logger.info(f"No running containers found with image '{image}'. Nothing to stop.")
+
+
+def start_mailserver(client: docker.DockerClient, image: str):
+    """Starts a mailserver container with default settings."""
+    logger.info("Starting mailserver with default settings...")
+    containers = detect_stopped_containers(client, image)
+    if containers:
+        for container in containers:
+            logger.debug(f"Starting stopped container '{container.name}' (id: {container.short_id})...")
+            container.start()
+            logger.debug(f"Container '{container.name}' started.")
+        logger.info("All stopped containers started.")
+    else:
+        logger.info(f"No stopped containers found with image '{image}'. Nothing to start.")
+
+
 # Parser auxiliary functions
 
 def parse_json_arg(value):
@@ -224,15 +272,28 @@ def main():
         prog="mailserver-configurator",
         description="A tool to configure, start or stop a mail server. Primarily for Docker Mailserver. If an argument starts with [DC], it is related to Docker container configuration. If it starts with [MS], it is related to mail server configuration.",
     )
-    parser.add_argument("--postmaster", type=str, required=True, help="Postmaster email and password in the format '<email>:<password>'. <email> must include the domain.")
-    parser.add_argument("--hostname", type=str, default="mail", help="[DC] Hostname for the mail server.")
-    parser.add_argument("--domainname", type=str, default="example.local", help="[DC] Domain name for the mail server.")
-    parser.add_argument("--users", type=parse_list_arg, default=[], help="List of user emails to create like 'user1@domain:pass1,user2@domain:pass2'. Each entry should be in the format '<email>:<password>'. <email> must include the domain. If a user already exists, it will be skipped.")
-    parser.add_argument("--args", type=parse_json_arg, default={}, help="[MS] Additional arguments to pass to the Docker container as environment variables. This should be a dictionary of key-value pairs in the format: '{\"KEY1\": \"string_value\", \"KEY2\": numeric_or_boolean_value}'.")
-    parser.add_argument("--image", type=str, default="docker.io/mailserver/docker-mailserver:latest", help="[DC] Docker image to use for the mail server. If any container with this image is already running, it will be stopped and removed before starting a new one.")
-    parser.add_argument("--get-container-args", action="store_true", help="If set, it gets the argument such as the container name and ports from any running container with the specified image and uses them to start the new container. If no such container is found, it uses default values.", default=True)
-    parser.add_argument("--no-get-container-args", action="store_false", dest="get_container_args", help="Disables the --get-container-args option.")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging.", default=False)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Subcommands
+    init_parser = subparsers.add_parser("init", help="Initializes and starts the mail server with the specified configuration. If a container with the specified image is already running, it will be stopped and removed before starting a new one.")
+    init_parser.add_argument("--postmaster", type=str, required=True, help="Postmaster email and password in the format '<email>:<password>'. <email> must include the domain.")
+    init_parser.add_argument("--hostname", type=str, default="mail", help="[DC] Hostname for the mail server.")
+    init_parser.add_argument("--domainname", type=str, default="example.local", help="[DC] Domain name for the mail server.")
+    init_parser.add_argument("--users", type=parse_list_arg, default=[], help="List of user emails to create like 'user1@domain:pass1,user2@domain:pass2'. Each entry should be in the format '<email>:<password>'. <email> must include the domain. If a user already exists, it will be skipped.")
+    init_parser.add_argument("--args", type=parse_json_arg, default={}, help="[MS] Additional arguments to pass to the Docker container as environment variables. This should be a dictionary of key-value pairs in the format: '{\"KEY1\": \"string_value\", \"KEY2\": numeric_or_boolean_value}'.")
+    init_parser.add_argument("--image", type=str, default="docker.io/mailserver/docker-mailserver:latest", help="[DC] Docker image to use for the mail server. If any container with this image is already running, it will be stopped and removed before starting a new one.")
+    init_parser.add_argument("--get-container-args", action="store_true", help="If set, it gets the argument such as the container name and ports from any running container with the specified image and uses them to start the new container. If no such container is found, it uses default values.", default=True)
+    init_parser.add_argument("--no-get-container-args", action="store_false", dest="get_container_args", help="Disables the --get-container-args option.")
+    init_parser.add_argument("--debug", action="store_true", help="Enable debug logging.", default=False)
+
+    start_parser = subparsers.add_parser("start", help="Starts any mail server.")
+    start_parser.add_argument("--image", type=str, default="docker.io/mailserver/docker-mailserver:latest", help="[DC] Docker image used for the mail server. All containers with this image will be stopped and removed.")
+    start_parser.add_argument("--debug", action="store_true", help="Enable debug logging.", default=False)
+
+    stop_parser = subparsers.add_parser("stop", help="Stops any running mail server.")
+    stop_parser.add_argument("--image", type=str, default="docker.io/mailserver/docker-mailserver:latest", help="[DC] Docker image used for the mail server. All containers with this image will be stopped and removed.")
+    stop_parser.add_argument("--debug", action="store_true", help="Enable debug logging.", default=False)
+
 
     args, unknown = parser.parse_known_args()
 
@@ -245,6 +306,18 @@ def main():
     logger.info("Starting mailserver-configurator.")
     if unknown:
         logger.warning(f"Unknown arguments ignored: {unknown}.")
+
+
+    client = docker.from_env()
+
+    if args.command == "stop":
+        stop_mailserver(client, args.image)
+        logger.info("Finishing mailserver-configurator.")
+        exit(0)
+    elif args.command == "start":
+        start_mailserver(client, args.image)
+        logger.info("Finishing mailserver-configurator.")
+        exit(0)
 
     processed_postmaster = split_email_pass(args.postmaster)
     if not processed_postmaster:
@@ -278,11 +351,9 @@ def main():
     elif "POSTMASTER_ADDRESS" not in args.args:
         args.args["POSTMASTER_ADDRESS"] = processed_postmaster[0]
         logger.debug(f"Setting POSTMASTER_ADDRESS in args to {processed_postmaster[0]}.")
-    
-    client = docker.from_env()
 
     # Check for existing containers, get name and ports, and remove them
-    containers = detect_running_containers(client, args.image)
+    containers = detect_existing_containers(client, args.image)
     name, port_bindings = None, None
     if containers:
         if args.get_container_args:
