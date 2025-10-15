@@ -1,6 +1,8 @@
 import os
 import argparse
 import logging
+import docker
+import time
 
 from logging.handlers import RotatingFileHandler
 
@@ -38,6 +40,102 @@ file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
 
+# Setup mailserver
+
+def setup_mailserver(client: docker.DockerClient):
+    logger.info("Starting Docker Mailserver container...")
+
+    # Create necessary directories
+    abs_dirs = [
+        os.path.abspath("./data/mail"), 
+        os.path.abspath("./data/state"), 
+        os.path.abspath("./config")
+    ]
+    for dir_name in abs_dirs:
+        logger.info(f"Volume directory: {dir_name}")
+        # os.makedirs(dir_name, exist_ok=True)
+
+    # Run container
+    container = client.containers.run(
+        "docker.io/mailserver/docker-mailserver:latest",
+        name="mailserver-python",
+        hostname="mail",
+        domainname="cobra.org",
+        detach=True,
+        ports={
+            "25/tcp": 25,
+            "587/tcp": 587,
+            "110/tcp": 110,
+            "143/tcp": 143,
+            "993/tcp": 993,
+        },
+        cap_add=["NET_ADMIN", "SYS_PTRACE"],
+        environment={
+            "ENABLE_CLAMAV": "0",
+            "ENABLE_SPAMASSASSIN": "0",
+            "ENABLE_POSTGREY": "0",
+            "ENABLE_FAIL2BAN": "0",
+            "DMS_DEBUG": "0",
+            "POSTMASTER_ADDRESS": "postmaster@cobra.org",
+        },
+        volumes={
+            abs_dirs[0]: {"bind": "/var/mail"},  #, "mode": "rw"},
+            abs_dirs[1]: {"bind": "/var/mail-state"},  # , "mode": "rw"},
+            abs_dirs[2]: {"bind": "/tmp/docker-mailserver"}  # , "mode": "rw"},
+        },
+        restart_policy={"Name": "unless-stopped"},
+    )
+
+    logger.info(f"Container '{container.name}' started (id: {container.short_id}).")
+
+    # Wait until it's running
+    for _ in range(20):
+        container.reload()
+        if container.status == "running":
+            logger.info("Mailserver is now running.")
+            break
+        time.sleep(1)
+    else:
+        logger.error("Mailserver failed to start.")
+        return
+
+    # Create postmaster account
+    logger.info("Creating postmaster account...")
+    exit_code, output = container.exec_run(
+        ["setup", "email", "add", "postmaster@cobra.org", "Admin1234!"]
+    )
+
+    if exit_code == 0:
+        logger.info("Postmaster account created successfully.")
+    else:
+        logger.error(f"Failed to create postmaster: {output.decode('utf-8')}")
+
+    # Check user list
+    time.sleep(3)  # Wait a bit for the user to be created
+    exit_code, output = container.exec_run(["setup", "email", "list"])
+    if exit_code == 0:
+        logger.info(f"Current email users:\n{output.decode('utf-8')}")
+    else:
+        logger.error(f"Failed to list users: {output.decode('utf-8')}")
+
+    # Check user list with doveadm
+    exit_code, output = container.exec_run(["doveadm", "user", "*", "list"])
+    if exit_code == 0:
+        logger.info(f"Dovecot users:\n{output.decode('utf-8')}")
+    else:
+        logger.error(f"Failed to list dovecot users: {output.decode('utf-8')}")
+
+    # Wait 30 seconds before stopping
+    logger.info("Mailserver will run for 30 seconds before stopping...")
+    time.sleep(30)
+    logger.info("Stopping mailserver container...")
+
+    container.stop()
+    container.remove(v=True, force=True)
+    logger.info("Mailserver container stopped and removed.")
+
+    logger.info("Mailserver setup complete.")
+
 # Main
 
 def main():
@@ -60,8 +158,8 @@ def main():
     if unknown:
         logger.warning(f"Unknown arguments ignored: {unknown}.")
     
-    # Placeholder for actual mail server configuration logic
-    logger.info("Mail server configuration logic would go here.")
+    client = docker.from_env()
+    setup_mailserver(client)
 
     logger.info("Finishing mailserver-configurator.")
 
