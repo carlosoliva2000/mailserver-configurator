@@ -226,7 +226,7 @@ def main():
     )
     parser.add_argument("--postmaster", type=str, required=True, help="Postmaster email and password in the format '<email>:<password>'. <email> must include the domain.")
     parser.add_argument("--hostname", type=str, default="mail", help="[DC] Hostname for the mail server.")
-    parser.add_argument("--domain", type=str, default="example.local", help="[DC] Domain name for the mail server.")
+    parser.add_argument("--domainname", type=str, default="example.local", help="[DC] Domain name for the mail server.")
     parser.add_argument("--users", type=parse_list_arg, default=[], help="List of user emails to create like 'user1@domain:pass1,user2@domain:pass2'. Each entry should be in the format '<email>:<password>'. <email> must include the domain. If a user already exists, it will be skipped.")
     parser.add_argument("--args", type=parse_json_arg, default={}, help="[MS] Additional arguments to pass to the Docker container as environment variables. This should be a dictionary of key-value pairs in the format: '{\"KEY1\": \"string_value\", \"KEY2\": numeric_or_boolean_value}'.")
     parser.add_argument("--image", type=str, default="docker.io/mailserver/docker-mailserver:latest", help="[DC] Docker image to use for the mail server. If any container with this image is already running, it will be stopped and removed before starting a new one.")
@@ -264,11 +264,14 @@ def main():
 
     if args.image == "docker.io/mailserver/docker-mailserver:latest" and not args.args:
         args.args = {
+            "ENABLE_IMAP": "1",
+            "ENABLE_POP3": "0",
             "ENABLE_CLAMAV": "0",
+            "ENABLE_AMAVIS": "0",
             "ENABLE_SPAMASSASSIN": "0",
             "ENABLE_POSTGREY": "0",
             "ENABLE_FAIL2BAN": "0",
-            "DMS_DEBUG": "0",
+            "SPOOF_PROTECTION": "0",
             "POSTMASTER_ADDRESS": processed_postmaster[0],
         }
         logger.warning(f"Using default image and no additional args. Enabling some common features: {args.args}.")
@@ -315,7 +318,7 @@ def main():
         name=name,
         ports=port_bindings,
         hostname=args.hostname,
-        domainname=args.domain,
+        domainname=args.domainname,
         postmaster=processed_postmaster,
         users=processed_users,
         environment=args.args
