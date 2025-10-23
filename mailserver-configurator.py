@@ -119,7 +119,8 @@ def setup_mailserver(
         domainname: str,
         postmaster: Tuple[str, str],
         users: List[Tuple[str, str]],
-        environment: Dict[str, Any]
+        environment: Dict[str, Any],
+        ssl_path: Optional[str] = None
     ) -> docker.models.containers.Container:
     """Sets up and runs the mailserver Docker container."""
     logger.info("Starting Docker Mailserver container...")
@@ -130,8 +131,26 @@ def setup_mailserver(
         os.path.abspath("./data/state"), 
         os.path.abspath("./config")
     ]
-    for dir_name in abs_dirs:
-        logger.debug(f"Volume directory: {dir_name}")
+    volumes = {
+        abs_dirs[0]: {"bind": "/var/mail"},  #, "mode": "rw"},
+        abs_dirs[1]: {"bind": "/var/mail-state"},  # , "mode": "rw"},
+        abs_dirs[2]: {"bind": "/tmp/docker-mailserver"},  # , "mode": "rw"},
+        "/etc/localtime": {"bind": "/etc/localtime", "mode": "ro"},  # Sync time with host
+    }
+
+    if ssl_path:
+        if environment.get("SSL_TYPE", None) == 'manual':
+            cert_path = environment.get("SSL_CERT_PATH", "")
+            dir_cert_path = os.path.dirname(cert_path) if cert_path else None
+            if dir_cert_path:
+                volumes[os.path.abspath(ssl_path)] = {"bind": dir_cert_path}  # , "mode": "ro"}
+        elif environment.get("SSL_TYPE", None) == 'self-signed':
+            volumes[os.path.abspath(ssl_path)] = {"bind": "/tmp/docker-mailserver/ssl/"}  # , "mode": "ro"}
+        else:
+            logger.warning("SSL_PATH provided but SSL_TYPE is not set to 'manual' or 'self-signed'. SSL will not be used.")
+
+    for host_dir, bind in volumes.items():
+        logger.debug(f"Volume directory: {host_dir} -> {bind}.")
         # os.makedirs(dir_name, exist_ok=True)
 
     try:
@@ -145,11 +164,7 @@ def setup_mailserver(
             ports=ports,
             cap_add=["NET_ADMIN", "SYS_PTRACE"],
             environment=environment,
-            volumes={
-                abs_dirs[0]: {"bind": "/var/mail"},  #, "mode": "rw"},
-                abs_dirs[1]: {"bind": "/var/mail-state"},  # , "mode": "rw"},
-                abs_dirs[2]: {"bind": "/tmp/docker-mailserver"}  # , "mode": "rw"},
-            },
+            volumes=volumes,
             restart_policy={"Name": "unless-stopped"},
         )
 
@@ -164,6 +179,7 @@ def setup_mailserver(
             time.sleep(1)
         else:
             raise RuntimeError("Mailserver container failed to start within the expected time.")
+        time.sleep(5)  # Wait a bit more for the mailserver to be fully ready
 
         # Create postmaster account
         logger.info("Creating postmaster account...")
@@ -175,7 +191,10 @@ def setup_mailserver(
         if exit_code == 0:
             logger.info(f"Postmaster account {postmaster_email} created successfully.")
         else:
-            raise RuntimeError(f"Failed to create postmaster account {postmaster_email}: {output.decode('utf-8')}")
+            if "already exists" in output.decode('utf-8'):
+                logger.warning(f"Postmaster {postmaster_email} already exists. Skipping creation.")
+            else:
+                raise RuntimeError(f"Failed to create postmaster account {postmaster_email}: {output.decode('utf-8')}")
 
         # Create additional users
         logger.info("Creating additional user accounts...")
@@ -194,7 +213,7 @@ def setup_mailserver(
                     logger.error(f"Failed to create user {user_email}: {output.decode('utf-8')}")
 
         # Check user list
-        time.sleep(3)  # Wait a bit for the user to be created
+        time.sleep(10)  # Wait a bit for the user to be created
         exit_code, output = container.exec_run(["setup", "email", "list"])
         if exit_code == 0:
             logger.debug(f"Current email users:\n{output.decode('utf-8')}")
@@ -280,10 +299,13 @@ def main():
     init_parser.add_argument("--hostname", type=str, default="mail", help="[DC] Hostname for the mail server.")
     init_parser.add_argument("--domainname", type=str, default="example.local", help="[DC] Domain name for the mail server.")
     init_parser.add_argument("--users", type=parse_list_arg, default=[], help="List of user emails to create like 'user1@domain:pass1,user2@domain:pass2'. Each entry should be in the format '<email>:<password>'. <email> must include the domain. If a user already exists, it will be skipped.")
-    init_parser.add_argument("--args", type=parse_json_arg, default={}, help="[MS] Additional arguments to pass to the Docker container as environment variables. This should be a dictionary of key-value pairs in the format: '{\"KEY1\": \"string_value\", \"KEY2\": numeric_or_boolean_value}'.")
+    init_parser.add_argument("--env", type=parse_json_arg, default={}, help="[MS] Additional arguments to pass to the Docker container as environment variables. This should be a dictionary of key-value pairs in the format: '{\"KEY1\": \"string_value\", \"KEY2\": numeric_or_boolean_value}'.")
     init_parser.add_argument("--image", type=str, default="docker.io/mailserver/docker-mailserver:latest", help="[DC] Docker image to use for the mail server. If any container with this image is already running, it will be stopped and removed before starting a new one.")
     init_parser.add_argument("--get-container-args", action="store_true", help="If set, it gets the argument such as the container name and ports from any running container with the specified image and uses them to start the new container. If no such container is found, it uses default values.", default=True)
     init_parser.add_argument("--no-get-container-args", action="store_false", dest="get_container_args", help="Disables the --get-container-args option.")
+    init_parser.add_argument("--ssl-path", type=str, help="[MS] Path to the SSL directory containing the SSL certificate and key files to use for the mail server. If not provided, no SSL will be used.", default=None)
+    init_parser.add_argument("--add-common-features", "-F", action="store_true", help="[MS] If set, it adds some common features like setting the postmaster address automatically, enabling IMAP, and disabling POP3, ClamAV, Amavis, Fail2Ban and spoof protection, and setting unlimited size messages. If any of these features are already set in --env, they will not be overridden.", default=False)
+    # init_parser.add_argument("--ssl-key", type=str, help="[MS] Path to the SSL key file to use for the mail server. If not provided, no SSL will be used.")
     init_parser.add_argument("--debug", action="store_true", help="Enable debug logging.", default=False)
 
     start_parser = subparsers.add_parser("start", help="Starts any mail server.")
@@ -331,12 +353,51 @@ def main():
 
     logger.debug(f"Input arguments: {args}")
 
-    if "POSTMASTER_ADDRESS" in args.args:
+    if "POSTMASTER_ADDRESS" in args.env:
         logger.warning("POSTMASTER_ADDRESS found in args. It will be overridden by the --postmaster argument.")
-        del args.args["POSTMASTER_ADDRESS"]
+        del args.env["POSTMASTER_ADDRESS"]
 
-    if args.image == "docker.io/mailserver/docker-mailserver:latest" and not args.args:
-        args.args = {
+    if args.ssl_path and "SSL_CERT_PATH" in args.env and "SSL_KEY_PATH" in args.env and args.env.get("SSL_TYPE").lower() == "manual":
+        # Command to generate self-signed certificate for testing purposes
+        # openssl req -x509 -nodes -newkey rsa:2048 \
+        #   -days 365 \
+        #   -keyout ./certs/mail.key \
+        #   -out ./certs/mail.crt \
+        #   -subj "/CN=mail.cobra.org"
+
+        # Check the paths share the same directory
+        cert_path = os.path.dirname(args.env["SSL_CERT_PATH"])
+        key_path = os.path.dirname(args.env["SSL_KEY_PATH"])
+        if cert_path != key_path:
+            logger.error("SSL_CERT_PATH and SSL_KEY_PATH must be in the same directory inside the container. Exiting.")
+            exit(1)
+        # Check the path ssl_path exists in the host
+        if not os.path.isdir(os.path.abspath(args.ssl_path)):
+            logger.error(f"SSL path '{args.ssl_path}' does not exist in the host. Exiting.")
+            exit(1)
+        logger.info("SSL_CERT_PATH and SSL_KEY_PATH found in args with SSL_TYPE set to 'manual'. SSL will be enabled with the provided paths.")
+    
+    if args.ssl_path and args.env.get("SSL_TYPE").lower() == "self-signed":
+        # Follow the instructions at https://docker-mailserver.github.io/docker-mailserver/latest/config/security/ssl/#self-signed-certificates
+        
+        # Check the path ssl_path exists in the host
+        if not os.path.isdir(os.path.abspath(args.ssl_path)):
+            logger.error(f"SSL path '{args.ssl_path}' does not exist in the host. Exiting.")
+            exit(1)
+        else:
+            # Check the directory contains <FQDN>-key.pem, <FQDN>-cert.pem and demoCA/cacert.pem
+            fqdn = f"{args.hostname}.{args.domainname}"
+            key_file = os.path.join(os.path.abspath(args.ssl_path), f"{fqdn}-key.pem")
+            cert_file = os.path.join(os.path.abspath(args.ssl_path), f"{fqdn}-cert.pem")
+            cacert_file = os.path.join(os.path.abspath(args.ssl_path), "demoCA", "cacert.pem")
+            if not (os.path.isfile(key_file) and os.path.isfile(cert_file) and os.path.isfile(cacert_file)):
+                logger.error(f"SSL path '{args.ssl_path}' does not contain the required files: '{key_file}', '{cert_file}' and '{cacert_file}'. Exiting.")
+                exit(1)
+            logger.info("SSL_TYPE set to 'self-signed' and SSL paths found in the provided directory. SSL will be enabled with the provided paths.")
+
+    if args.image == "docker.io/mailserver/docker-mailserver:latest" and args.add_common_features:
+        current_env = args.env.copy()
+        args.env = {
             "ENABLE_IMAP": "1",
             "ENABLE_POP3": "0",
             "ENABLE_CLAMAV": "0",
@@ -346,10 +407,12 @@ def main():
             "ENABLE_FAIL2BAN": "0",
             "SPOOF_PROTECTION": "0",
             "POSTMASTER_ADDRESS": processed_postmaster[0],
+            "POSTFIX_MESSAGE_SIZE_LIMIT": 0
         }
-        logger.warning(f"Using default image and no additional args. Enabling some common features: {args.args}.")
-    elif "POSTMASTER_ADDRESS" not in args.args:
-        args.args["POSTMASTER_ADDRESS"] = processed_postmaster[0]
+        args.env.update(current_env)  # Do not override any existing setting
+        logger.info("Added some common features to args: enabling IMAP, disabling POP3, ClamAV, Amavis, SpamAssassin, Postgrey and Fail2Ban, disabling spoof protection, setting unlimited size messages and setting the postmaster address automatically.")
+    elif "POSTMASTER_ADDRESS" not in args.env:
+        args.env["POSTMASTER_ADDRESS"] = processed_postmaster[0]
         logger.debug(f"Setting POSTMASTER_ADDRESS in args to {processed_postmaster[0]}.")
 
     # Check for existing containers, get name and ports, and remove them
@@ -374,15 +437,17 @@ def main():
     
     if not port_bindings:
         port_bindings = {
-            "25/tcp": 25,
-            "110/tcp": 110,
-            "143/tcp": 143,
-            "587/tcp": 587,
-            "993/tcp": 993
+            "25/tcp": 25,  # SMTP  (explicit TLS => STARTTLS)
+            "110/tcp": 110,  # POP3
+            "143/tcp": 143,  # IMAP4 (explicit TLS => STARTTLS)
+            "465/tcp": 465,  # ESMTP (implicit TLS)
+            "587/tcp": 587,  # ESMTP (explicit TLS => STARTTLS)
+            "993/tcp": 993,  # IMAP4 (implicit TLS)
+            "995/tcp": 995,  # POP3 (with TLS)
         }
         logger.warning(f"No existing container found or --get-container-args disabled. Using default port bindings: {port_bindings}.")
 
-    logger.debug(f"Processed environment variables for container: {args.args}.")
+    logger.debug(f"Processed environment variables for container: {args.env}.")
     container = setup_mailserver(
         client=client,
         image=args.image,
@@ -392,7 +457,8 @@ def main():
         domainname=args.domainname,
         postmaster=processed_postmaster,
         users=processed_users,
-        environment=args.args
+        environment=args.env,
+        ssl_path=args.ssl_path
     )
 
     # # Wait 30 seconds before stopping
