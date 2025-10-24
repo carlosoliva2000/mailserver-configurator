@@ -237,6 +237,14 @@ def setup_mailserver(
         exit(1)
 
 
+def setup_api_server(host: str, port: int, debug: bool = False):
+    """Sets up and runs the FastAPI server."""
+    import uvicorn
+    from api_server import app
+    logger.info(f"Setting up FastAPI server on {host}:{port}...")
+    uvicorn.run("api_server:app", host=host, port=port)
+
+
 # Start/stop mailserver
 
 def stop_mailserver(client: docker.DockerClient, image: str):
@@ -306,10 +314,16 @@ def main():
     init_parser.add_argument("--ssl-path", type=str, help="[MS] Path to the SSL directory containing the SSL certificate and key files to use for the mail server. If not provided, no SSL will be used.", default=None)
     init_parser.add_argument("--add-common-features", "-F", action="store_true", help="[MS] If set, it adds some common features like setting the postmaster address automatically, enabling IMAP, and disabling POP3, ClamAV, Amavis, Fail2Ban and spoof protection, and setting unlimited size messages. If any of these features are already set in --env, they will not be overridden.", default=False)
     # init_parser.add_argument("--ssl-key", type=str, help="[MS] Path to the SSL key file to use for the mail server. If not provided, no SSL will be used.")
+    init_parser.add_argument("--api", action="store_true", help="If set, it starts the FastAPI server to manage the mail server via API calls.", default=False)
+    init_parser.add_argument("--api-host", type=str, default="0.0.0.0", help="Host for the FastAPI server. Only used if --api is set (default: 0.0.0.0).")
+    init_parser.add_argument("--api-port", type=int, default=9999, help="Port for the FastAPI server. Only used if --api is set (default: 9999).")
     init_parser.add_argument("--debug", action="store_true", help="Enable debug logging.", default=False)
 
     start_parser = subparsers.add_parser("start", help="Starts any mail server.")
     start_parser.add_argument("--image", type=str, default="docker.io/mailserver/docker-mailserver:latest", help="[DC] Docker image used for the mail server. All containers with this image will be stopped and removed.")
+    start_parser.add_argument("--api", action="store_true", help="If set, it starts the FastAPI server to manage the mail server via API calls.", default=False)
+    start_parser.add_argument("--api-host", type=str, default="0.0.0.0", help="Host for the FastAPI server. Only used if --api is set (default: 0.0.0.0).")
+    start_parser.add_argument("--api-port", type=int, default=9999, help="Port for the FastAPI server. Only used if --api is set (default: 9999).")
     start_parser.add_argument("--debug", action="store_true", help="Enable debug logging.", default=False)
 
     stop_parser = subparsers.add_parser("stop", help="Stops any running mail server.")
@@ -339,6 +353,8 @@ def main():
     elif args.command == "start":
         start_mailserver(client, args.image)
         logger.info("Finishing mailserver-configurator.")
+        if args.api:
+            setup_api_server(host=args.api_host, port=args.api_port, debug=args.debug)
         exit(0)
 
     processed_postmaster = split_email_pass(args.postmaster)
@@ -469,6 +485,9 @@ def main():
     # logger.info("Mailserver container stopped and removed.")
 
     logger.info("Finishing mailserver-configurator.")
+    
+    if args.api:
+        setup_api_server(host=args.api_host, port=args.api_port, debug=args.debug)
 
 
 if __name__ == "__main__":
