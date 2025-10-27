@@ -40,15 +40,18 @@ container = containers[0] if containers else None
         status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Failed to list users."}
     }
 )
-async def list_users(quotas: bool = False):
+async def list_users(quotas: bool = False, filter_by: Optional[str] = "*"):
     if not container:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mailserver container not found.")
+
+    if not filter_by:
+        filter_by = "*"
     
     # Execute the command to list users inside the container
     if quotas:
         command = ["setup", "email", "list"]
     else:
-        command = ["doveadm", "user", "*", "list"]
+        command = ["doveadm", "user", filter_by, "list"]
     exit_code, output = container.exec_run(command)
 
     if exit_code == 0:
