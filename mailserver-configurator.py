@@ -56,45 +56,123 @@ def split_email_pass(email_pass: str) -> Optional[Tuple[str, str]]:
         logger.error(f"Error parsing email:password '{email_pass}': {e}")
 
 
-def detect_existing_containers(client: docker.DockerClient, image: str, only_running: bool = False) -> Optional[List[docker.models.containers.Container]]:
-    """Detects if containers with the specified image already exists (optionally, if they are running too)."""
-    if only_running:
-        containers = client.containers.list(filters={"ancestor": image})
-    else:
-        containers = client.containers.list(all=True, filters={"ancestor": image})
+def normalize_image_name(image: str) -> str:
+    """
+    Normalize a Docker image name by:
+    - Removing tag (after last :)
+    - Removing digest (after @)
+    - Removing registry (docker.io, localhost:5000, IP:port, etc.)
+    """
+    # Remove digest if present
+    image = image.split("@", 1)[0]
 
-    if containers:
-        names = [container.name for container in containers]
-        short_ids = [container.short_id for container in containers]
-        tuples = list(zip(names, short_ids))
-        logger.debug(f"Found running containers with image '{image}': {tuples}.")
-        return containers
-    else:
-        logger.debug(f"No running container found with image '{image}'.")
-        return None
-    
+    # Remove tag (only the LAST colon)
+    if ":" in image:
+        image = image.rsplit(":", 1)[0]
 
-def detect_stopped_containers(client: docker.DockerClient, image: str) -> Optional[List[docker.models.containers.Container]]:
-    """Detects if containers with the specified image are stopped."""
-    containers = client.containers.list(all=True, filters={"ancestor": image, "status": "exited"})
+    parts = image.split("/")
 
-    if containers:
-        names = [container.name for container in containers]
-        short_ids = [container.short_id for container in containers]
-        tuples = list(zip(names, short_ids))
-        logger.debug(f"Found stopped containers with image '{image}': {tuples}.")
-        return containers
-    else:
-        logger.debug(f"No stopped container found with image '{image}'.")
-        return None
-    
+    # Detect registry
+    if (
+        len(parts) > 1
+        and (
+            "." in parts[0]
+            or ":" in parts[0]
+            or parts[0] == "localhost"
+        )
+    ):
+        parts = parts[1:]
 
-def get_container_args(container: docker.models.containers.Container):
+    return "/".join(parts)
+
+
+def detect_existing_containers(
+    client: docker.DockerClient,
+    image: str,
+    only_running: bool = False
+) -> Optional[List[docker.models.containers.Container]]:
+    """
+    Detect containers whose image matches the given image name
+    (ignoring registry and tag).
+    Optionally, if the are only running containers.
+    """
+    target = normalize_image_name(image)
+
+    containers = client.containers.list(all=not only_running)
+
+    matched = []
+
+    for container in containers:
+        for tag in container.image.tags or []:
+            normalized = normalize_image_name(tag)
+            if normalized == target:
+                matched.append(container)
+                break
+
+    if matched:
+        names = [(c.name, c.short_id) for c in matched]
+        logger.debug(
+            f"Found containers matching image '{image}' "
+            f"(normalized='{target}'): {names}"
+        )
+        return matched
+
+    logger.debug(
+        f"No container found matching image '{image}' "
+        f"(normalized='{target}')."
+    )
+    return None
+
+
+def detect_stopped_containers(
+    client: docker.DockerClient,
+    image: str
+) -> Optional[List[docker.models.containers.Container]]:
+    """Detect containers with the given image that are stopped (exited)."""
+
+    target = normalize_image_name(image)
+
+    containers = client.containers.list(all=True)
+
+    matched = []
+
+    for container in containers:
+        if container.status != "exited":
+            continue
+
+        for tag in container.image.tags or []:
+            normalized = normalize_image_name(tag)
+            if normalized == target:
+                matched.append(container)
+                break
+
+    if matched:
+        names = [(c.name, c.short_id) for c in matched]
+        logger.debug(
+            f"Found stopped containers matching image '{image}' "
+            f"(normalized='{target}'): {names}"
+        )
+        return matched
+
+    logger.debug(
+        f"No stopped container found matching image '{image}' "
+        f"(normalized='{target}')."
+    )
+    return None
+
+
+def get_container_args(container: docker.models.containers.Container) -> Tuple[Optional[str], Optional[Dict[str, int]], Optional[str]]:
     """Extracts relevant arguments from a running container."""
     try:
         name = container.name
         port_bindings = container.attrs["HostConfig"]["PortBindings"]
         ports = {k: int(v[0]['HostPort']) for k, v in port_bindings.items()}
+        image = (
+            container.image.tags[0]
+            if container.image.tags
+            else container.image.id
+        )
+
         # hostname = container.attrs['Config']['Hostname']
         # domainname = container.attrs['Config']['Domainname']
         # ports = container.attrs['NetworkSettings']['Ports']
@@ -104,10 +182,36 @@ def get_container_args(container: docker.models.containers.Container):
         #     key, _, value = env.partition("=")
         #     env_dict[key] = value
         # logger.info(f"Extracted args from container '{name}': hostname={hostname}, domainname={domainname}, ports={ports}, environment={env_dict}.")
-        return name, ports
+        return name, ports, image
     except Exception as e:
         logger.error(f"Error extracting args from container '{container.name}': {e}")
-        return None, None
+        return None, None, None
+    
+
+def resolve_local_image(
+    client: docker.DockerClient,
+    image: str
+) -> Optional[str]:
+    """
+    Find a local Docker image matching the normalized name.
+    Returns the full image tag if found.
+    """
+
+    target = normalize_image_name(image)
+
+    for img in client.images.list():
+        for tag in img.tags or []:
+            if normalize_image_name(tag) == target:
+                logger.debug(
+                    f"Resolved local image '{tag}' for requested image '{image}'"
+                )
+                return tag
+
+    logger.debug(
+        f"No local image found matching '{image}' (normalized='{target}')."
+    )
+    return None
+
 
 
 def setup_mailserver(
@@ -306,28 +410,29 @@ def main():
     init_parser.add_argument("--postmaster", type=str, required=True, help="Postmaster email and password in the format '<email>:<password>'. <email> must include the domain.")
     init_parser.add_argument("--hostname", type=str, default="mail", help="[DC] Hostname for the mail server.")
     init_parser.add_argument("--domainname", type=str, default="example.local", help="[DC] Domain name for the mail server.")
-    init_parser.add_argument("--users", type=parse_list_arg, default=[], help="List of user emails to create like 'user1@domain:pass1,user2@domain:pass2'. Each entry should be in the format '<email>:<password>'. <email> must include the domain. If a user already exists, it will be skipped.")
-    init_parser.add_argument("--env", type=parse_json_arg, default={}, help="[MS] Additional arguments to pass to the Docker container as environment variables. This should be a dictionary of key-value pairs in the format: '{\"KEY1\": \"string_value\", \"KEY2\": numeric_or_boolean_value}'.")
-    init_parser.add_argument("--image", type=str, default="docker.io/mailserver/docker-mailserver:latest", help="[DC] Docker image to use for the mail server. If any container with this image is already running, it will be stopped and removed before starting a new one.")
+    init_parser.add_argument("--user", action="append", help="A user in the format '<email>:<password>'. <email> must include the domain. If a user already exists, it will be skipped. You can specify this argument as many times as needed.")
+    init_parser.add_argument("--envs", type=parse_json_arg, default={}, help="[MS] Additional arguments to pass to the Docker container as environment variables. This should be a dictionary of key-value pairs in the format: '{\"KEY1\": \"string_value\", \"KEY2\": numeric_or_boolean_value}'. Not compatible with --env.")
+    init_parser.add_argument("--env", action="append", type=str, help="[MS] Additional arguments to pass to the Docker container as environment variables. This should be in the format 'KEY=VALUE'. You can specify this argument as many times as needed. Not compatible with --envs.")
+    init_parser.add_argument("--image", type=str, default="mailserver/docker-mailserver", help="[DC] Docker image to use for the mail server. If any container with this image is already running, it will be stopped and removed before starting a new one. It ignores the registry and tag.")
     init_parser.add_argument("--get-container-args", action="store_true", help="If set, it gets the argument such as the container name and ports from any running container with the specified image and uses them to start the new container. If no such container is found, it uses default values.", default=True)
     init_parser.add_argument("--no-get-container-args", action="store_false", dest="get_container_args", help="Disables the --get-container-args option.")
     init_parser.add_argument("--ssl-path", type=str, help="[MS] Path to the SSL directory containing the SSL certificate and key files to use for the mail server. If not provided, no SSL will be used.", default=None)
-    init_parser.add_argument("--add-common-features", "-F", action="store_true", help="[MS] If set, it adds some common features like setting the postmaster address automatically, enabling IMAP, and disabling POP3, ClamAV, Amavis, Fail2Ban and spoof protection, and setting unlimited size messages. If any of these features are already set in --env, they will not be overridden.", default=False)
+    init_parser.add_argument("--add-common-features", "-F", action="store_true", help="[MS] If set, it adds some common features like setting the postmaster address automatically, enabling IMAP, and disabling POP3, ClamAV, Amavis, Fail2Ban and spoof protection, setting unlimited size messages and disabling update checks. If any of these features are already set in --env, they will not be overridden.", default=False)
     # init_parser.add_argument("--ssl-key", type=str, help="[MS] Path to the SSL key file to use for the mail server. If not provided, no SSL will be used.")
     init_parser.add_argument("--api", action="store_true", help="If set, it starts the FastAPI server to manage the mail server via API calls.", default=False)
     init_parser.add_argument("--api-host", type=str, default="0.0.0.0", help="Host for the FastAPI server. Only used if --api is set (default: 0.0.0.0).")
-    init_parser.add_argument("--api-port", type=int, default=9999, help="Port for the FastAPI server. Only used if --api is set (default: 9999).")
+    init_parser.add_argument("--api-port", type=int, default=24421, help="Port for the FastAPI server. Only used if --api is set (default: 24421).")
     init_parser.add_argument("--debug", action="store_true", help="Enable debug logging.", default=False)
 
     start_parser = subparsers.add_parser("start", help="Starts any mail server.")
-    start_parser.add_argument("--image", type=str, default="docker.io/mailserver/docker-mailserver:latest", help="[DC] Docker image used for the mail server. All containers with this image will be stopped and removed.")
+    start_parser.add_argument("--image", type=str, default="mailserver/docker-mailserver", help="[DC] Docker image used for the mail server. All containers with this image will be stopped and removed. It ignores the registry and tag.")
     start_parser.add_argument("--api", action="store_true", help="If set, it starts the FastAPI server to manage the mail server via API calls.", default=False)
     start_parser.add_argument("--api-host", type=str, default="0.0.0.0", help="Host for the FastAPI server. Only used if --api is set (default: 0.0.0.0).")
-    start_parser.add_argument("--api-port", type=int, default=9999, help="Port for the FastAPI server. Only used if --api is set (default: 9999).")
+    start_parser.add_argument("--api-port", type=int, default=24421, help="Port for the FastAPI server. Only used if --api is set (default: 24421).")
     start_parser.add_argument("--debug", action="store_true", help="Enable debug logging.", default=False)
 
     stop_parser = subparsers.add_parser("stop", help="Stops any running mail server.")
-    stop_parser.add_argument("--image", type=str, default="docker.io/mailserver/docker-mailserver:latest", help="[DC] Docker image used for the mail server. All containers with this image will be stopped and removed.")
+    stop_parser.add_argument("--image", type=str, default="mailserver/docker-mailserver", help="[DC] Docker image used for the mail server. All containers with this image will be stopped and removed. It ignores the registry and tag.")
     stop_parser.add_argument("--debug", action="store_true", help="Enable debug logging.", default=False)
 
 
@@ -343,6 +448,22 @@ def main():
     if unknown:
         logger.warning(f"Unknown arguments ignored: {unknown}.")
 
+    # Check if both --env and --envs are used
+    if args.env and args.envs:
+        logger.error("Both --env and --envs cannot be used at the same time. Please use only one of them. Exiting.")
+        exit(1)
+    
+    if args.env:
+        # Convert list of KEY=VALUE strings to dictionary
+        envs = {}
+        for env_var in args.env:
+            if "=" not in env_var:
+                logger.error(f"Invalid environment variable format: '{env_var}'. It must be in the format 'KEY=VALUE'. Exiting.")
+                exit(1)
+            key, value = env_var.split("=", 1)
+            envs[key] = value
+    else:
+        envs = args.envs
 
     client = docker.from_env()
 
@@ -362,18 +483,21 @@ def main():
         logger.error("Invalid postmaster argument. Exiting.")
         exit(1)
     
-    processed_users = [split_email_pass(user) for user in args.users]
+    processed_users = [split_email_pass(user) for user in args.user]
     if None in processed_users:
         logger.error("One or more invalid user arguments. Exiting.")
         exit(1)
 
     logger.debug(f"Input arguments: {args}")
 
-    if "POSTMASTER_ADDRESS" in args.env:
+    if "POSTMASTER_ADDRESS" in envs:
         logger.warning("POSTMASTER_ADDRESS found in args. It will be overridden by the --postmaster argument.")
-        del args.env["POSTMASTER_ADDRESS"]
+        del envs["POSTMASTER_ADDRESS"]
 
-    if args.ssl_path and "SSL_CERT_PATH" in args.env and "SSL_KEY_PATH" in args.env and args.env.get("SSL_TYPE").lower() == "manual":
+    if args.ssl_path:
+        args.ssl_path = os.path.abspath(os.path.expanduser(args.ssl_path))
+
+    if args.ssl_path and "SSL_CERT_PATH" in envs and "SSL_KEY_PATH" in envs and envs.get("SSL_TYPE", "").lower() == "manual":
         # Command to generate self-signed certificate for testing purposes
         # openssl req -x509 -nodes -newkey rsa:2048 \
         #   -days 365 \
@@ -382,8 +506,8 @@ def main():
         #   -subj "/CN=mail.cobra.org"
 
         # Check the paths share the same directory
-        cert_path = os.path.dirname(args.env["SSL_CERT_PATH"])
-        key_path = os.path.dirname(args.env["SSL_KEY_PATH"])
+        cert_path = os.path.dirname(envs["SSL_CERT_PATH"])
+        key_path = os.path.dirname(envs["SSL_KEY_PATH"])
         if cert_path != key_path:
             logger.error("SSL_CERT_PATH and SSL_KEY_PATH must be in the same directory inside the container. Exiting.")
             exit(1)
@@ -393,7 +517,7 @@ def main():
             exit(1)
         logger.info("SSL_CERT_PATH and SSL_KEY_PATH found in args with SSL_TYPE set to 'manual'. SSL will be enabled with the provided paths.")
     
-    if args.ssl_path and args.env.get("SSL_TYPE").lower() == "self-signed":
+    if args.ssl_path and envs.get("SSL_TYPE", "").lower() == "self-signed":
         # Follow the instructions at https://docker-mailserver.github.io/docker-mailserver/latest/config/security/ssl/#self-signed-certificates
         
         # Check the path ssl_path exists in the host
@@ -411,9 +535,9 @@ def main():
                 exit(1)
             logger.info("SSL_TYPE set to 'self-signed' and SSL paths found in the provided directory. SSL will be enabled with the provided paths.")
 
-    if args.image == "docker.io/mailserver/docker-mailserver:latest" and args.add_common_features:
-        current_env = args.env.copy()
-        args.env = {
+    if "mailserver/docker-mailserver" in args.image and args.add_common_features:
+        current_env = envs.copy()
+        envs = {
             "ENABLE_IMAP": "1",
             "ENABLE_POP3": "0",
             "ENABLE_CLAMAV": "0",
@@ -423,21 +547,22 @@ def main():
             "ENABLE_FAIL2BAN": "0",
             "SPOOF_PROTECTION": "0",
             "POSTMASTER_ADDRESS": processed_postmaster[0],
-            "POSTFIX_MESSAGE_SIZE_LIMIT": 0
+            "POSTFIX_MESSAGE_SIZE_LIMIT": 0,
+            "ENABLE_UPDATE_CHECK": "0",
         }
-        args.env.update(current_env)  # Do not override any existing setting
+        envs.update(current_env)  # Do not override any existing setting
         logger.info("Added some common features to args: enabling IMAP, disabling POP3, ClamAV, Amavis, SpamAssassin, Postgrey and Fail2Ban, disabling spoof protection, setting unlimited size messages and setting the postmaster address automatically.")
-    elif "POSTMASTER_ADDRESS" not in args.env:
-        args.env["POSTMASTER_ADDRESS"] = processed_postmaster[0]
+    elif "POSTMASTER_ADDRESS" not in envs:
+        envs["POSTMASTER_ADDRESS"] = processed_postmaster[0]
         logger.debug(f"Setting POSTMASTER_ADDRESS in args to {processed_postmaster[0]}.")
 
     # Check for existing containers, get name and ports, and remove them
     containers = detect_existing_containers(client, args.image)
-    name, port_bindings = None, None
+    name, port_bindings, resolved_image = None, None, None
     if containers:
         if args.get_container_args:
-            name, port_bindings = get_container_args(containers[0])
-            logger.info(f"Using args from existing container '{name}': name={name}, port_bindings={port_bindings}.")
+            name, port_bindings, resolved_image = get_container_args(containers[0])
+            logger.info(f"Using args from existing container '{name}': name={name}, port_bindings={port_bindings}, image={resolved_image}.")
 
         logger.info("Removing existing containers...")
         for container in containers:
@@ -449,7 +574,7 @@ def main():
     
     if not name:
         name = "mailserver-python"
-        logger.warning(f"No existing container found or --get-container-args disabled. Using default name: {name}.")
+        logger.warning(f"No container name found or --get-container-args disabled. Using default name: {name}.")
     
     if not port_bindings:
         port_bindings = {
@@ -461,19 +586,29 @@ def main():
             "993/tcp": 993,  # IMAP4 (implicit TLS)
             "995/tcp": 995,  # POP3 (with TLS)
         }
-        logger.warning(f"No existing container found or --get-container-args disabled. Using default port bindings: {port_bindings}.")
+        logger.warning(f"No port bindings found or --get-container-args disabled. Using default port bindings: {port_bindings}.")
 
-    logger.debug(f"Processed environment variables for container: {args.env}.")
+    final_image = None
+    if resolved_image:
+        final_image = resolved_image
+    else:
+        local_image = resolve_local_image(client, args.image)
+        final_image = local_image if local_image else args.image
+    
+    logger.debug(f"Requested Docker image for mailserver: {args.image}.")
+    logger.debug(f"Resolved Docker image for mailserver: {final_image}.")
+
+    logger.debug(f"Processed environment variables for container: {envs}.")
     container = setup_mailserver(
         client=client,
-        image=args.image,
+        image=final_image,
         name=name,
         ports=port_bindings,
         hostname=args.hostname,
         domainname=args.domainname,
         postmaster=processed_postmaster,
         users=processed_users,
-        environment=args.env,
+        environment=envs,
         ssl_path=args.ssl_path
     )
 
@@ -487,6 +622,7 @@ def main():
     logger.info("Finishing mailserver-configurator.")
     
     if args.api:
+        os.environ["MAILSERVER_CONTAINER"] = container.name
         setup_api_server(host=args.api_host, port=args.api_port, debug=args.debug)
 
 
