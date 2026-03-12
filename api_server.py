@@ -1,4 +1,6 @@
 import docker
+import docker.errors
+import os
 
 from typing import Optional
 from fastapi import FastAPI, HTTPException, status
@@ -7,7 +9,10 @@ from pydantic import BaseModel
 
 
 app = FastAPI(
-    title="Mailserver Configurator API"
+    title="Mailserver Configurator API",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
 )
 
 
@@ -24,11 +29,18 @@ class UserModel(UserModelUpdate):
 # Get the Docker client
 client = docker.from_env()
 
-# Find the mailserver container
-# TODO: pass this as an environment variable or configuration
-containers = client.containers.list(filters={"ancestor": "docker.io/mailserver/docker-mailserver:latest"})
-container = containers[0] if containers else None
+# Set the mailserver container from environment variable
+container_name = os.getenv("MAILSERVER_CONTAINER")
+if not container_name:
+    container = None
+else:
+    try:
+        container = client.containers.get(container_name)
+    except docker.errors.NotFound:
+        container = None
 
+
+# API Endpoints
 
 @app.get(
     "/users", 
